@@ -1,0 +1,11 @@
+# pnpm 11 起，这些设置**不再**从 package.json 的 `pnpm` 字段读取，
+# 必须放在本文件里（写错位置的症状是：pnpm 只打一行 WARN，然后设置静默失效）。
+#
+# esbuild 的 postinstall 默认被 pnpm 拦截，不放开则 `vite build` 起不来。
+# 注意旧名 `onlyBuiltDependencies` 在 pnpm 11 已不生效，要用 `allowBuilds` 的 map 形式。
+allowBuilds:
+  esbuild: true
+
+# `overrides` 由 scripts/use-local-packages.sh 按需写入（指向本地 packed tarball）。
+# 之所以必须用 overrides 而不是只改直接依赖：@floatctf/react 自身依赖
+# @floatctf/sdk@1.0.0，只改直接依赖的话这条**传递依赖**仍会去 registry 找而 404。
