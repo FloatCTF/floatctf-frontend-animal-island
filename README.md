@@ -185,6 +185,38 @@ mise exec -- pnpm --filter @floatctf/frontend-animal-island build
   （重新登录解决不了权限问题）。见 `src/api/client.ts`。
 - 前端守卫只判断「有没有会话」与「入口显不显示」；**权限判定永远在服务端**。
 
+## 制品发布（CI / GitHub Release）
+
+`.github/workflows/release.yml` 在 `main`、`v*` tag 与手动 dispatch 时构建 3 个资产，
+消费方（平台宿主）**只下载、不构建**：不执行本仓库代码，也不需要 Node。
+
+| 资产 | 说明 |
+|---|---|
+| `frontend-dist.tar.gz` | `tar -C dist .` 打包，`frontend.json` 在归档根部（`frontend.sh` 的 `normalize_artifact_root` 无需猜层级） |
+| `frontend-dist.tar.gz.sha256` | 校验和 |
+| `BUILD_INFO.json` | 构建元数据（repository/commit/ref/workflow_run/node/files/bytes/built_at）。其中 **`frontend` 字段是 `dist/frontend.json`（制品 manifest）的原样副本**，供前端市场与人工核对读取 `id`/`version`/`compatibility`，**无需下载整个 tar.gz** |
+
+稳定下载地址（滚动通道，public 仓库无需凭据）：
+
+```bash
+gh release download frontend-latest -R FloatCTF/floatctf-frontend-animal-island -p 'frontend-dist.tar.gz*'
+sha256sum -c frontend-dist.tar.gz.sha256
+frontend.sh install frontend-dist.tar.gz
+```
+
+`v*` tag 会额外产出永久保留的版本 release（资产名相同）。
+
+`@floatctf/*` 未发布到 npm，CI 因此：克隆平台 monorepo → `pnpm install --frozen-lockfile` →
+`scripts/package-sdk-dist.sh`（构建并打包三个包，确定性命名 + fail-closed 校验）→
+`./scripts/use-local-packages.sh <dir>`（把 `pnpm-workspace.yaml` 的 `overrides` 指向本地 tarball，
+覆盖传递依赖）→ `pnpm install --no-lockfile` → `pnpm build` →
+硬检查 `dist/frontend.json`（存在、**不含 `build` 段**、字段齐全、声明的 entry/styles 在）→ 打包。
+
+> 契约对齐：制品的 `compatibility.frontendRuntime` / `apiContract` 必须与平台 monorepo 的
+> `packages/frontend-runtime/src/version.ts` 一致，否则消费侧 `frontend.sh` 会拒绝安装。
+> 可用仓库变量 `FLOATCTF_MONOREPO_REF`（默认 `main`）指定平台 ref；不一致时 CI 在构建前显式失败，
+> 而不是产出装不上的制品。
+
 ## 许可
 
 AGPL-3.0-only，见 [LICENSE](./LICENSE)。

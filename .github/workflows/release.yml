@@ -1,0 +1,311 @@
+# FloatCTF 前端制品发布（frontend id: `animal-island`）：main 每次合并后构建一次，
+# 产出可直接被平台消费的**预构建制品**。
+#
+# 设计前提与训练站（`FloatCTF/floatctf-training`）完全一致：消费方（平台宿主）
+# **只下载、不构建**——不执行本仓库的任何代码，也不需要 Node。平台
+# `frontend.sh install <artifact.tar.gz>` 走 `kind="artifact"` 分支：
+# 解包 → `normalize_artifact_root` → `validate_artifact_tree` → `validate_manifest_file`，
+# 因此归档必须用 `tar -C dist .`（`frontend.json` 直接在根部，且不含符号链接/特殊文件）。
+#
+# 稳定下载地址（public 仓库，消费方无需凭据）：
+#   https://github.com/FloatCTF/floatctf-frontend-animal-island/releases/download/frontend-latest/frontend-dist.tar.gz
+#   同目录另有 frontend-dist.tar.gz.sha256 与 BUILD_INFO.json
+#
+# BUILD_INFO.json：训练站那份元数据（repository/commit/ref/workflow_run/node/files/bytes/
+# built_at）**外加** `frontend` 字段——它是 `dist/frontend.json`（制品 manifest）的
+# **原样副本**，供「前端市场」与人工核对直接读取 id / name / version / compatibility
+# （frontendRuntime、apiContract），**无需下载整个 tar.gz**。
+#
+# 依赖前提：`@floatctf/sdk`、`@floatctf/frontend-runtime`、`@floatctf/react` **未发布到 npm**，
+# 所以本工作流先克隆平台 monorepo 构建这些包，再用 `scripts/use-local-packages.sh`
+# 把 `pnpm-workspace.yaml` 的 `overrides` 指向本地 tarball（只改直接依赖不够：
+# `@floatctf/react` 自身依赖 `@floatctf/sdk`，这条传递依赖也必须被 override）。
+#
+# 仓库变量（Settings → Secrets and variables → Actions → Variables，均可选）：
+#   FLOATCTF_MONOREPO_REF  平台 monorepo 的 ref，默认 `main`。仅当需要临时指向
+#                          某个分支/标签（例如契约升级尚未并入 main）时设置。
+
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# 同一 ref 的发布串行化，避免两个 main 提交同时改同一个滚动 release。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      ARCHIVE: frontend-dist.tar.gz
+      CHECKSUM: frontend-dist.tar.gz.sha256
+      BUILD_INFO: BUILD_INFO.json
+      ROLLING_TAG: frontend-latest
+      MONOREPO_REPO: https://github.com/FloatCTF/floatctf.git
+    steps:
+      - uses: actions/checkout@v4
+
+      # 与平台 monorepo CI 同版本（pnpm 11：`package.json` 的 `pnpm` 字段与旧名
+      # `onlyBuiltDependencies` 均已失效，配置必须写在 pnpm-workspace.yaml）。
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.20.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # @floatctf/* 不在 npm 上，必须在平台 monorepo 里构建 + 打包。
+      # 用平台自带的 scripts/package-sdk-dist.sh：确定性命名（floatctf-sdk-<V>.tgz …）
+      # 且 fail-closed（缺 dist 入口、残留 `workspace:` 范围、版本不一致都会当场失败，
+      # 不会悄悄产出「只有 package.json + README」的空壳 tarball）。
+      - name: Prepare @floatctf/* tarballs from platform monorepo
+        env:
+          REF: ${{ vars.FLOATCTF_MONOREPO_REF }}
+          MONO_DIR: ${{ runner.temp }}/floatctf-monorepo
+          PKGS_DIR: ${{ runner.temp }}/floatctf-pkgs
+        run: |
+          set -euo pipefail
+          ref="${REF:-main}"
+          echo "平台 monorepo ref: $ref"
+          git clone --depth 1 --branch "$ref" "$MONOREPO_REPO" "$MONO_DIR"
+          cd "$MONO_DIR"
+          pnpm install --frozen-lockfile
+          ./scripts/package-sdk-dist.sh "$PKGS_DIR"
+          ls -l "$PKGS_DIR"
+
+      # 契约对齐预检：把「构建期才知道」的契约不匹配提前成一句可操作的话。
+      # 消费侧 frontend.sh 会拒绝 apiContract 与平台不一致的制品，这里先对一次。
+      - name: Check API/runtime contract alignment
+        env:
+          MONO_DIR: ${{ runner.temp }}/floatctf-monorepo
+        run: |
+          set -euo pipefail
+          node - "$MONO_DIR/packages/frontend-runtime/src/version.ts" <<'JS'
+          const fs = require("fs");
+
+          const versionTs = fs.readFileSync(process.argv[2], "utf8");
+          const pick = (name) => {
+            const m = new RegExp(`export const ${name} = "([^"]+)"`).exec(versionTs);
+            if (!m) throw new Error(`无法从 version.ts 解析 ${name}`);
+            return m[1];
+          };
+          const runtimeMajor = pick("FRONTEND_RUNTIME_VERSION");
+          const apiMajor = pick("API_CONTRACT_VERSION");
+
+          const src = JSON.parse(fs.readFileSync("floatctf.frontend.json", "utf8"));
+          const compat = src.compatibility ?? {};
+          const problems = [];
+          const majorOf = (v) => String(v ?? "").split(".")[0];
+          if (majorOf(compat.frontendRuntime) !== runtimeMajor) {
+            problems.push(
+              `frontendRuntime=${compat.frontendRuntime} 与平台运行时契约 ${runtimeMajor} 不一致`,
+            );
+          }
+          if (majorOf(compat.apiContract) !== apiMajor) {
+            problems.push(
+              `apiContract=${compat.apiContract} 与平台 API 契约 ${apiMajor} 不一致`,
+            );
+          }
+          console.log(
+            `平台契约：runtime ${runtimeMajor} / api ${apiMajor}；本前端：` +
+              `runtime ${compat.frontendRuntime} / api ${compat.apiContract}`,
+          );
+          if (problems.length) {
+            console.error("");
+            console.error("::error title=契约不一致::" + problems.join("；"));
+            console.error(
+              "制品会被消费侧 frontend.sh 拒绝（validate_manifest_file 要求 major 相等）。",
+            );
+            console.error(
+              "若是平台契约刚升级而尚未并入默认 ref：把仓库变量 FLOATCTF_MONOREPO_REF " +
+                "指向已包含该升级的 ref 后重跑；本仓库自身的声明不要为了过 CI 而下调。",
+            );
+            process.exit(1);
+          }
+          JS
+
+      - name: Point @floatctf/* at local tarballs
+        env:
+          PKGS_DIR: ${{ runner.temp }}/floatctf-pkgs
+        run: ./scripts/use-local-packages.sh "$PKGS_DIR"
+
+      - name: Install dependencies
+        run: pnpm install --no-lockfile
+
+      # 走仓库自己的完整门禁（`vite build && tsc --noEmit`）；构建期 Vite 插件会用
+      # 真实校验器 parseFrontendManifest 自检生成的 frontend.json，不通过即失败。
+      - name: Build
+        run: pnpm build
+
+      # 发布前硬检查：制品 manifest 必须存在、**不含 `build` 段**、字段齐全、声明的资产在。
+      - name: Verify dist/frontend.json
+        run: |
+          set -euo pipefail
+          test -f dist/frontend.json
+          node - <<'JS'
+          const fs = require("fs");
+          const path = "dist/frontend.json";
+          const m = JSON.parse(fs.readFileSync(path, "utf8"));
+          const fail = (msg) => {
+            console.error(`::error title=${path} 不合规::${msg}`);
+            process.exit(1);
+          };
+          if ("build" in m) {
+            fail("制品 manifest 不得包含 `build` 段（该段只属于源码 manifest floatctf.frontend.json）");
+          }
+          for (const key of [
+            "schemaVersion",
+            "id",
+            "name",
+            "version",
+            "description",
+            "author",
+            "compatibility",
+            "entry",
+            "styles",
+          ]) {
+            if (!(key in m)) fail(`缺少字段 ${key}`);
+          }
+          for (const key of ["frontendRuntime", "apiContract"]) {
+            if (!m.compatibility || typeof m.compatibility[key] !== "string") {
+              fail(`compatibility.${key} 必须是字符串`);
+            }
+          }
+          if (!fs.existsSync(`dist/${m.entry}`)) fail(`entry 不存在: ${m.entry}`);
+          for (const style of m.styles) {
+            if (!fs.existsSync(`dist/${style}`)) fail(`styles 声明了不存在的文件: ${style}`);
+          }
+          console.log(
+            `frontend.json ok: ${m.id}@${m.version} (runtime ${m.compatibility.frontendRuntime} / ` +
+              `api ${m.compatibility.apiContract}, entry=${m.entry}, styles=${m.styles.join(",")})`,
+          );
+          JS
+
+      - name: Package artifact
+        run: |
+          set -euo pipefail
+
+          # 消费侧 validate_artifact_tree 会拒绝符号链接/特殊文件；提前拦住。
+          # 注意：列出命中项不要用 `| head`（head 提前退出会让 find 收到 SIGPIPE，
+          # 在 `set -o pipefail` 下整条管道非 0，把检查本身变成失败）。
+          if [ -n "$(find dist -type l -print -quit)" ]; then
+            echo "::error title=dist 含符号链接::frontend.sh verify 会拒绝该制品"
+            find dist -type l | sed -n '1,20p'
+            exit 1
+          fi
+          if [ -n "$(find dist ! -type f ! -type d -print -quit)" ]; then
+            echo "::error title=dist 含特殊文件::frontend.sh verify 会拒绝该制品"
+            find dist ! -type f ! -type d | sed -n '1,20p'
+            exit 1
+          fi
+
+          FILES="$(find dist -type f | wc -l | tr -d ' ')"
+          BYTES="$(du -sb dist | cut -f1)"
+          export FILES BYTES
+
+          # BUILD_INFO.json = 训练站那份元数据 + `frontend`（= dist/frontend.json 原样副本，
+          # 供前端市场读 id/version/compatibility，无需下载整个制品）。
+          node - <<'JS'
+          const fs = require("fs");
+          const manifest = JSON.parse(fs.readFileSync("dist/frontend.json", "utf8"));
+          const info = {
+            repository: process.env.GITHUB_REPOSITORY,
+            commit: process.env.GITHUB_SHA,
+            ref: process.env.GITHUB_REF,
+            workflow_run:
+              process.env.GITHUB_SERVER_URL +
+              "/" + process.env.GITHUB_REPOSITORY +
+              "/actions/runs/" + process.env.GITHUB_RUN_ID,
+            node: process.version,
+            files: Number(process.env.FILES),
+            bytes: Number(process.env.BYTES),
+            built_at: new Date().toISOString(),
+            // 制品 manifest 原样副本：前端市场/人工核对用，不要只取部分字段。
+            frontend: manifest,
+          };
+          fs.writeFileSync("BUILD_INFO.json", JSON.stringify(info, null, 2) + "\n");
+          JS
+          cat BUILD_INFO.json
+
+          # 固定属主/时间戳并按文件名排序，让同样的内容尽量得到同样的归档；
+          # `-C dist .` 让 frontend.json 落在归档根部（消费侧最省事的形态）。
+          tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@0 \
+            -cf - -C dist . | gzip -9n > "$ARCHIVE"
+          sha256sum "$ARCHIVE" > "$CHECKSUM"
+          cat "$CHECKSUM"
+          # 同样避免 `| head`：tar 收到 SIGPIPE 会让本步骤在 pipefail 下失败。
+          tar tzf "$ARCHIVE" | sed -n '1,20p'
+
+      - name: Upload build artifact (可回滚的历史)
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: |
+            frontend-dist.tar.gz
+            frontend-dist.tar.gz.sha256
+            BUILD_INFO.json
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Publish rolling release (main)
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$ROLLING_TAG"
+          title="前端制品 · FloatCTF Animal Island（滚动通道）"
+          notes="$(cat <<EOF
+          自动构建的预构建前端制品，来自 \`main\` 的最新提交。
+
+          - 前端：\`$(node -p "require('./BUILD_INFO.json').frontend.id")@$(node -p "require('./BUILD_INFO.json').frontend.version")\`
+          - 契约：runtime \`$(node -p "require('./BUILD_INFO.json').frontend.compatibility.frontendRuntime")\` / api \`$(node -p "require('./BUILD_INFO.json').frontend.compatibility.apiContract")\`
+          - 提交：\`${GITHUB_SHA}\`
+          - 构建：[run ${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})
+
+          消费方式（只下载、不构建）：
+
+          \`\`\`bash
+          gh release download ${tag} -R ${GITHUB_REPOSITORY} -p 'frontend-dist.tar.gz*'
+          sha256sum -c frontend-dist.tar.gz.sha256
+          frontend.sh install frontend-dist.tar.gz
+          \`\`\`
+
+          \`BUILD_INFO.json\` 里的 \`frontend\` 字段是制品 \`frontend.json\` 的**原样副本**
+          （id / version / compatibility），供前端市场与人工核对，无需下载整个制品。
+
+          注意：本 release 是**滚动**的，tag \`${tag}\` 指向首次创建它的提交；
+          制品对应的真实提交以上面的提交号与 \`BUILD_INFO.json\` 为准。
+          EOF
+          )"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" \
+              "$ARCHIVE" "$CHECKSUM" "$BUILD_INFO" --clobber
+            gh release edit "$tag" --title "$title" --notes "$notes" --latest
+          else
+            gh release create "$tag" --title "$title" --notes "$notes" --latest \
+              "$ARCHIVE" "$CHECKSUM" "$BUILD_INFO"
+          fi
+          gh release view "$tag" --json tagName,url,assets
+
+      - name: Publish versioned release (v* tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          gh release create "$tag" \
+            --title "$tag" \
+            --notes "前端制品 FloatCTF Animal Island ${tag}（提交 ${GITHUB_SHA}）。永久保留，用于固定版本部署。" \
+            "$ARCHIVE" "$CHECKSUM" "$BUILD_INFO"
+          gh release view "$tag" --json tagName,url,assets
